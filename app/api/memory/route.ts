@@ -6,15 +6,10 @@ import {
   getMemoriesByGroup,
   updateMemory,
   deleteMemory,
+  type Memory,
 } from "@/lib/memory";
 
-type MemoryRecord = {
-  id: number;
-  category: string;
-  content: string;
-  created_at: string;
-  updated_at: string;
-};
+type MemoryRecord = Memory;
 
 const USER_PREFIX_REGEX = /^\[user:([^\]]+)\]\s*/;
 
@@ -28,7 +23,6 @@ function parseScopedContent(rawContent: string): {
 } {
   const match = rawContent.match(USER_PREFIX_REGEX);
   if (!match) {
-    // Purani (legacy) memories ko guest/default scope mein rakho taaki doosre user mein na dikhein
     return { owner: "legacy_guest", cleanContent: rawContent };
   }
   return {
@@ -104,11 +98,11 @@ export async function GET(request: Request) {
     let rawMemories: MemoryRecord[];
 
     if (group) {
-      rawMemories = getMemoriesByGroup(group) as MemoryRecord[];
+      rawMemories = await getMemoriesByGroup(group);
     } else if (query) {
-      rawMemories = searchMemories(query) as MemoryRecord[];
+      rawMemories = await searchMemories(query);
     } else {
-      rawMemories = getAllMemories() as MemoryRecord[];
+      rawMemories = await getAllMemories();
     }
 
     const memories = filterAndCleanMemories(rawMemories, userKey, category);
@@ -156,11 +150,11 @@ export async function POST(request: Request) {
     }
 
     const scopedContent = `${getUserScopeTag(userKey)}${content.trim()}`;
-    const saved = saveMemory(scopedContent, category, {
+    const saved = await saveMemory(scopedContent, category, {
       groupKey,
       importance,
       source,
-    }) as MemoryRecord | null;
+    });
 
     if (!saved) {
       return Response.json(
@@ -218,7 +212,7 @@ export async function PUT(request: Request) {
       );
     }
 
-    const all = getAllMemories() as MemoryRecord[];
+    const all = await getAllMemories();
     const existing = all.find((item) => item.id === id);
     if (!existing) {
       return Response.json(
@@ -247,7 +241,7 @@ export async function PUT(request: Request) {
     }
 
     const scopedContent = `${getUserScopeTag(userKey)}${content.trim()}`;
-    const updated = updateMemory(id, scopedContent, category) as MemoryRecord | null;
+    const updated = await updateMemory(id, scopedContent, category);
 
     if (!updated) {
       return Response.json(
@@ -305,7 +299,7 @@ export async function DELETE(request: Request) {
       );
     }
 
-    const all = getAllMemories() as MemoryRecord[];
+    const all = await getAllMemories();
     const existing = all.find((item) => item.id === id);
     if (!existing) {
       return Response.json(
@@ -333,9 +327,9 @@ export async function DELETE(request: Request) {
       );
     }
 
-    const result = deleteMemory(id);
+    const result = await deleteMemory(id);
 
-    if (result.changes === 0) {
+    if (result?.error) {
       return Response.json(
         {
           success: false,
