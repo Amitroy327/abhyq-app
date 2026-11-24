@@ -37,8 +37,8 @@ type UserSettings = {
 };
 
 const STORAGE_KEY = "abhyq_conversations";
-
 const SETTINGS_KEY = "abhyq_user_settings";
+const AI_MODE_KEY = "abhyq_ai_mode";
 
 const DEFAULT_SETTINGS: UserSettings = {
   defaultVoiceLang: "en-IN",
@@ -160,6 +160,7 @@ export default function Home() {
 
   const [settings, setSettings] = useState<UserSettings>(DEFAULT_SETTINGS);
   const [settingsSavedToast, setSettingsSavedToast] = useState(false);
+  const [aiMode, setAiMode] = useState<"cloud" | "local">("cloud");
 
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -193,7 +194,7 @@ export default function Home() {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const recognitionRef = useRef<any>(null);
 
-  // LOAD SAVED SETTINGS
+  // LOAD SAVED SETTINGS & AI MODE
   useEffect(() => {
     try {
       const raw = localStorage.getItem(SETTINGS_KEY);
@@ -209,10 +210,23 @@ export default function Home() {
         setVoiceLang(merged.defaultVoiceLang);
         setWebSearch(merged.defaultWebSearch);
       }
+
+      const savedMode = localStorage.getItem(AI_MODE_KEY);
+      if (savedMode === "local" || savedMode === "cloud") {
+        setAiMode(savedMode);
+      }
     } catch {
       // ignore invalid settings JSON
     }
   }, []);
+
+  function toggleAiMode() {
+    setAiMode((prev) => {
+      const next = prev === "cloud" ? "local" : "cloud";
+      localStorage.setItem(AI_MODE_KEY, next);
+      return next;
+    });
+  }
 
   function updateSettings(patch: Partial<UserSettings>) {
     setSettings((prev) => {
@@ -356,7 +370,7 @@ export default function Home() {
 
         setSavedChats(mergedChats);
       } catch (err) {
-        console.error("SQLite history loading error:", err);
+        console.error("Database history loading error:", err);
         setSavedChats(localChats);
       }
 
@@ -825,6 +839,7 @@ export default function Home() {
             },
           ],
           conversationId: chatId,
+          aiMode,
           webSearch,
           attachment: currentAttachment,
           title:
@@ -1126,10 +1141,24 @@ export default function Home() {
               </span>
             )}
 
-            <div className="status-pill">
-              <span className="status-dot" />
-              Local AI
-            </div>
+            <button
+              type="button"
+              className="status-pill"
+              onClick={toggleAiMode}
+              title="Switch between Cloud AI (Groq) and Local AI (Ollama)"
+            >
+              <span
+                className="status-dot"
+                style={{
+                  background: aiMode === "local" ? "#ffd400" : "#b8ed54",
+                  boxShadow:
+                    aiMode === "local"
+                      ? "0 0 9px #ffd400"
+                      : "0 0 9px #b8ed54",
+                }}
+              />
+              {aiMode === "local" ? "Local AI" : "Cloud AI"}
+            </button>
 
             <button
               type="button"
@@ -1286,7 +1315,11 @@ export default function Home() {
                           <span />
                           <span />
                           <small>
-                            {webSearch ? "Searching web..." : "Thinking..."}
+                            {webSearch
+                              ? "Searching web..."
+                              : aiMode === "local"
+                              ? "Thinking locally..."
+                              : "Thinking..."}
                           </small>
                         </div>
                       </div>
@@ -1315,7 +1348,9 @@ export default function Home() {
                         : "FILE MODE"
                       : webSearch
                       ? "LIVE WEB MODE"
-                      : "AI STREAM MODE"}
+                      : aiMode === "local"
+                      ? "LOCAL AI MODE"
+                      : "CLOUD STREAM MODE"}
                   </span>
                 </div>
 
@@ -1460,7 +1495,7 @@ export default function Home() {
             <div className="memory-toolbar">
               <div>
                 <strong>{memories.length} Memories</strong>
-                <span>Stored in your local database</span>
+                <span>Stored in your cloud database</span>
               </div>
 
               <button onClick={loadMemories} disabled={memoryLoading}>
@@ -1607,6 +1642,22 @@ export default function Home() {
                     <span className="memory-category">ASSISTANT</span>
                     <h3>Voice &amp; Search Defaults</h3>
                   </div>
+                </div>
+
+                <div className="settings-row">
+                  <div>
+                    <strong>AI Engine Mode</strong>
+                    <span>Switch between Cloud AI (Groq) and Local AI (Ollama)</span>
+                  </div>
+                  <button
+                    type="button"
+                    className={`toggle-btn ${
+                      aiMode === "local" ? "toggle-on" : ""
+                    }`}
+                    onClick={toggleAiMode}
+                  >
+                    {aiMode === "local" ? "LOCAL" : "CLOUD"}
+                  </button>
                 </div>
 
                 <div className="settings-row">
@@ -2122,10 +2173,18 @@ export default function Home() {
           align-items: center;
           gap: 7px;
           padding: 7px 11px;
-          border: 1px solid rgba(255, 212, 0, 0.17);
+          border: 1px solid rgba(255, 212, 0, 0.28);
           border-radius: 20px;
-          color: #aaa;
+          background: rgba(255, 255, 255, 0.03);
+          color: #ddd;
           font-size: 10px;
+          font-weight: 600;
+          transition: 0.2s;
+        }
+
+        .status-pill:hover {
+          border-color: var(--yellow);
+          background: rgba(255, 212, 0, 0.08);
         }
 
         .status-dot,

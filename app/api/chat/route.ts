@@ -17,6 +17,8 @@ type ChatMessage = {
   content: string;
 };
 
+type AiMode = "cloud" | "local";
+
 type MemoryDetection = {
   category: string;
   groupKey: string | null;
@@ -508,15 +510,16 @@ function getSaveConfirmation(category: string): string {
 
 export async function POST(request: Request) {
   try {
+    const body = await request.json();
+    const aiMode: AiMode = body.aiMode === "local" ? "local" : "cloud";
+
     const apiKey = process.env.GROQ_API_KEY;
-    if (!apiKey) {
+    if (aiMode === "cloud" && !apiKey) {
       return Response.json(
         { reply: "GROQ_API_KEY missing hai. .env.local check karo." },
         { status: 500 }
       );
     }
-
-    const body = await request.json();
 
     const useWebSearch = Boolean(body.webSearch);
     const attachment =
@@ -853,6 +856,115 @@ STRICT ANTI-HALLUCINATION: Do not invent facts. If the detail is missing from th
       role: item.role,
       content: item.content,
     }));
+
+    // LOCAL AI MODE (OLLAMA)
+    if (aiMode === "local") {
+      const ollamaBaseUrl = (
+        process.env.OLLAMA_URL || "http://127.0.0.1:11434"
+      ).replace(/\/+$/, "");
+      const ollamaModel = process.env.OLLAMA_MODEL || "llama3.2";
+
+      console.log(
+        "ABHYQ SOURCE -> LOCAL OLLAMA | URL:",
+        ollamaBaseUrl,
+        "| MODEL:",
+        ollamaModel
+      );
+
+      let ollamaResponse: Response;
+      try {
+        ollamaResponse = await fetch(`${ollamaBaseUrl}/api/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: ollamaModel,
+            stream: true,
+            messages: [{ role: "system", content: systemPrompt }, ...conversation],
+          }),
+          signal: AbortSignal.timeout(12000),
+        });
+      } catch {
+        return Response.json(
+          {
+            reply:
+              "Local AI (Ollama) abhi connect nahi ho pa raha hai. Agar tum live Vercel site pe ho toh Local AI sirf tab chalega jab tumhare laptop mein Ollama chal raha ho aur URL reachable ho—ya topbar se Cloud AI switch kar lo.",
+          },
+          { status: 503 }
+        );
+      }
+
+      if (!ollamaResponse.ok || !ollamaResponse.body) {
+        const errText = await ollamaResponse.text().catch(() => "");
+        return Response.json(
+          {
+            reply: `Local AI error (${ollamaResponse.status}): ${
+              errText.slice(0, 160) || "Ollama model available nahi hai."
+            }`,
+          },
+          { status: 503 }
+        );
+      }
+
+      const encoder = new TextEncoder();
+      const decoder = new TextDecoder();
+      const reader = ollamaResponse.body.getReader();
+
+      const stream = new ReadableStream({
+        async start(controller) {
+          let fullReply = "";
+          let buffer = "";
+
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split("\n");
+              buffer = lines.pop() || "";
+
+              for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+                try {
+                  const parsed = JSON.parse(trimmed);
+                  const token = parsed?.message?.content || "";
+                  if (token) {
+                    fullReply += token;
+                    controller.enqueue(encoder.encode(token));
+                  }
+                } catch {
+                  // ignore partial JSON line
+                }
+              }
+            }
+
+            if (!fullReply.trim()) {
+              const fallback =
+                "Local AI ne khali response diya. Dobara try karo ya Cloud AI use karo.";
+              fullReply = fallback;
+              controller.enqueue(encoder.encode(fallback));
+            }
+
+            await persistConversation(fullReply.trim());
+            controller.close();
+          } catch (err) {
+            console.error("Local AI Stream Error:", err);
+            if (fullReply.trim()) {
+              await persistConversation(fullReply.trim());
+            }
+            controller.close();
+          }
+        },
+      });
+
+      return new Response(stream, {
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Cache-Control": "no-cache",
+        },
+      });
+    }
 
     const groqMessages: Array<Record<string, unknown>> = [
       { role: "system", content: systemPrompt },
