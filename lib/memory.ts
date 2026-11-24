@@ -1,10 +1,8 @@
-import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { createClient } from "@supabase/supabase-js";
 
 export type Memory = {
   id: number;
+  user_id?: string;
   category: string;
   content: string;
   group_key: string | null;
@@ -16,6 +14,7 @@ export type Memory = {
 };
 
 type SaveOptions = {
+  userId?: string;
   groupKey?: string | null;
   importance?: number;
   source?: string;
@@ -28,6 +27,7 @@ export type ConversationMessage = {
 
 export type Conversation = {
   id: string;
+  user_id?: string;
   title: string;
   created_at: string;
   updated_at: string;
@@ -106,7 +106,21 @@ const sensitivePatterns = [
   /\bmera\s+bank\s+account\b/i,
 ];
 
-let database: DatabaseSync | null = null;
+function getSupabase() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key =
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.SUPABASE_SECRET_KEY ||
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+  if (!url || !key) {
+    throw new Error("Missing Supabase URL or API key.");
+  }
+
+  return createClient(url, key, {
+    auth: { persistSession: false },
+  });
+}
 
 function normalizeText(text: string): string {
   return text
@@ -122,9 +136,7 @@ function normalizeCategory(category: string): string {
 }
 
 function normalizeImportance(value?: number): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    return 3;
-  }
+  if (typeof value !== "number" || !Number.isFinite(value)) return 3;
   return Math.max(1, Math.min(5, Math.round(value)));
 }
 
@@ -194,19 +206,14 @@ export function detectFavoriteColor(content: string): string | null {
 
   for (const pattern of patterns) {
     const match = text.match(pattern);
-    if (match?.[1]) {
-      return match[1].toLowerCase();
-    }
+    if (match?.[1]) return match[1].toLowerCase();
   }
 
   return null;
 }
 
 function getSemanticKey(content: string): string | null {
-  if (detectFavoriteColor(content)) {
-    return "preference:favorite-color";
-  }
-  return null;
+  return detectFavoriteColor(content) ? "preference:favorite-color" : null;
 }
 
 function inferGroupKey(
@@ -217,9 +224,7 @@ function inferGroupKey(
   const text = content.toLowerCase();
   if (/\babhyq\b/.test(text)) return "abhyq";
   if (/\bgharvix\b/.test(text)) return "gharvix";
-  if (suppliedGroupKey?.trim()) {
-    return suppliedGroupKey.trim().toLowerCase();
-  }
+  if (suppliedGroupKey?.trim()) return suppliedGroupKey.trim().toLowerCase();
   if (category === "preference") return "preferences";
   if (category === "goal") return "career-goals";
   if (category === "learning") return "learning";
@@ -229,17 +234,8 @@ function inferGroupKey(
 
 function prepareMemory(content: string, category: string) {
   const cleaned = cleanRememberPrefix(content).trim().replace(/\s+/g, " ");
-
-  if (containsSensitiveInformation(cleaned)) {
-    return null;
-  }
-
-  if (
-    !cleaned ||
-    cleaned.length < 4 ||
-    cleaned.length > 500 ||
-    isLikelyQuestion(cleaned)
-  ) {
+  if (containsSensitiveInformation(cleaned)) return null;
+  if (!cleaned || cleaned.length < 4 || cleaned.length > 500 || isLikelyQuestion(cleaned)) {
     return null;
   }
 
@@ -247,280 +243,31 @@ function prepareMemory(content: string, category: string) {
   const finalContent = favoriteColor
     ? `My favorite color is ${favoriteColor}`
     : cleaned.replace(/[.!?।]+$/g, "").trim();
-
-  const finalCategory = favoriteColor
-    ? "preference"
-    : normalizeCategory(category);
-
+  const finalCategory = favoriteColor ? "preference" : normalizeCategory(category);
   const normalized = normalizeText(finalContent);
   if (!normalized) return null;
 
-  return {
-    finalContent,
-    finalCategory,
-    normalized,
-    favoriteColor,
-  };
+  return { finalContent, finalCategory, normalized, favoriteColor };
 }
 
-function getDatabase(): DatabaseSync {
-  if (database) return database;
-
-  // Vercel serverless runtime is read-only everywhere except /tmp
-  const isServerless = Boolean(process.env.VERCEL);
-  const baseDirectory = isServerless
-    ? path.join(os.tmpdir(), "abhyq-data")
-    : path.join(process.cwd(), "data");
-
-  mkdirSync(baseDirectory, { recursive: true });
-
-  const db = new DatabaseSync(path.join(baseDirectory, "abhyq-memory.db"));
-  db.exec("PRAGMA foreign_keys = ON");
-
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS memories (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      category TEXT NOT NULL DEFAULT 'general',
-      content TEXT NOT NULL,
-      normalized_content TEXT NOT NULL UNIQUE,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      last_used_at TEXT,
-      group_key TEXT,
-      importance INTEGER NOT NULL DEFAULT 3,
-      source TEXT NOT NULL DEFAULT 'conversation'
-    );
-  `);
-
-  const columns = db
-    .prepare("PRAGMA table_info(memories)")
-    .all() as Array<{ name: string }>;
-  const existingColumns = new Set(columns.map((column) => column.name));
-
-  if (!existingColumns.has("group_key")) {
-    db.exec("ALTER TABLE memories ADD COLUMN group_key TEXT");
+function applyUserFilter<
+  T extends {
+    eq: (col: string, val: string) => T;
+    is: (col: string, val: null) => T;
   }
-  if (!existingColumns.has("importance")) {
-    db.exec(
-      "ALTER TABLE memories ADD COLUMN importance INTEGER NOT NULL DEFAULT 3"
-    );
-  }
-  if (!existingColumns.has("source")) {
-    db.exec(
-      "ALTER TABLE memories ADD COLUMN source TEXT NOT NULL DEFAULT 'conversation'"
-    );
-  }
-
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS conversations (
-      id TEXT PRIMARY KEY,
-      title TEXT NOT NULL DEFAULT 'New Chat',
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS conversation_messages (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      conversation_id TEXT NOT NULL,
-      role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
-      content TEXT NOT NULL,
-      position INTEGER NOT NULL,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-
-      FOREIGN KEY (conversation_id)
-        REFERENCES conversations(id)
-        ON DELETE CASCADE,
-
-      UNIQUE(conversation_id, position)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_conversations_updated
-    ON conversations(updated_at);
-
-    CREATE INDEX IF NOT EXISTS idx_conversation_messages
-    ON conversation_messages(conversation_id, position);
-
-    CREATE INDEX IF NOT EXISTS idx_memories_category
-    ON memories(category);
-
-    CREATE INDEX IF NOT EXISTS idx_memories_group
-    ON memories(group_key);
-
-    CREATE INDEX IF NOT EXISTS idx_memories_importance
-    ON memories(importance);
-  `);
-
-  database = db;
-
-  try {
-    cleanLegacyMemories(db);
-  } catch (error) {
-    database = null;
-    db.close();
-    throw error;
-  }
-
-  return db;
+>(query: T, userId?: string): T {
+  return userId ? query.eq("user_id", userId) : query;
 }
 
-function cleanLegacyMemories(db: DatabaseSync): void {
-  type LegacyMemory = {
-    id: number;
-    category: string;
-    content: string;
-    normalized_content: string;
-    group_key: string | null;
-    importance: number;
-    source: string;
-    created_at: string;
-    updated_at: string;
-    last_used_at: string | null;
-  };
-
-  const rows = db
-    .prepare(
-      `
-      SELECT *
-      FROM memories
-      ORDER BY updated_at DESC, id DESC
-      `
-    )
-    .all() as LegacyMemory[];
-
-  const candidates: Array<{
-    row: LegacyMemory;
-    content: string;
-    category: string;
-    normalized: string;
-    groupKey: string | null;
-    favoriteColor: boolean;
-  }> = [];
-
-  for (const row of rows) {
-    const cleaned = cleanRememberPrefix(row.content).trim().replace(/\s+/g, " ");
-
-    if (
-      !cleaned ||
-      cleaned.length < 4 ||
-      cleaned.length > 500 ||
-      isLikelyQuestion(cleaned) ||
-      containsSensitiveInformation(cleaned)
-    ) {
-      continue;
-    }
-
-    const color = detectFavoriteColor(cleaned);
-    const content = color
-      ? `My favorite color is ${color}`
-      : cleaned.replace(/[.!?।]+$/g, "").trim();
-
-    const category = color ? "preference" : normalizeCategory(row.category);
-    const normalized = normalizeText(content);
-    if (!normalized) continue;
-
-    candidates.push({
-      row,
-      content,
-      category,
-      normalized,
-      groupKey: inferGroupKey(
-        content,
-        category,
-        color ? "preferences" : row.group_key
-      ),
-      favoriteColor: Boolean(color),
-    });
-  }
-
-  const uniqueCandidates = new Map<string, (typeof candidates)[number]>();
-  for (const candidate of candidates) {
-    if (!uniqueCandidates.has(candidate.normalized)) {
-      uniqueCandidates.set(candidate.normalized, candidate);
-    }
-  }
-
-  let favoriteColorKept = false;
-  const finalCandidates = [...uniqueCandidates.values()].filter((candidate) => {
-    if (!candidate.favoriteColor) return true;
-    if (favoriteColorKept) return false;
-    favoriteColorKept = true;
-    return true;
-  });
-
-  const keepIds = new Set(finalCandidates.map((candidate) => candidate.row.id));
-
-  const updateRow = db.prepare(`
-    UPDATE memories
-    SET
-      category = ?,
-      content = ?,
-      normalized_content = ?,
-      group_key = ?,
-      updated_at = ?
-    WHERE id = ?
-  `);
-
-  const deleteRow = db.prepare("DELETE FROM memories WHERE id = ?");
-
-  db.exec("BEGIN");
-  try {
-    for (const row of rows) {
-      if (!keepIds.has(row.id)) {
-        deleteRow.run(row.id);
-      }
-    }
-
-    for (const candidate of finalCandidates) {
-      updateRow.run(
-        candidate.category,
-        candidate.content,
-        candidate.normalized,
-        candidate.groupKey,
-        candidate.row.updated_at,
-        candidate.row.id
-      );
-    }
-
-    db.exec("COMMIT");
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
-}
-
-function removeOldFavoriteColors(exceptId?: number): void {
-  const db = getDatabase();
-  const rows = db
-    .prepare(
-      `
-      SELECT id, content
-      FROM memories
-      WHERE category = 'preference'
-      `
-    )
-    .all() as Array<{ id: number; content: string }>;
-
-  const remove = db.prepare("DELETE FROM memories WHERE id = ?");
-
-  for (const row of rows) {
-    if (
-      getSemanticKey(row.content) === "preference:favorite-color" &&
-      row.id !== exceptId
-    ) {
-      remove.run(row.id);
-    }
-  }
-}
-
-export function saveMemory(
+export async function saveMemory(
   content: string,
   category = "general",
   options: SaveOptions = {}
-): Memory | null {
+): Promise<Memory | null> {
   const prepared = prepareMemory(content, category);
   if (!prepared) return null;
 
-  const db = getDatabase();
+  const supabase = getSupabase();
   const { finalContent, finalCategory, normalized, favoriteColor } = prepared;
   const groupKey = inferGroupKey(
     finalContent,
@@ -529,68 +276,67 @@ export function saveMemory(
   );
   const importance = normalizeImportance(options.importance);
   const source = options.source?.trim() || "conversation";
+  const now = new Date().toISOString();
 
-  db.exec("BEGIN");
-  try {
-    if (favoriteColor) {
-      removeOldFavoriteColors();
+  if (favoriteColor) {
+    let prefQuery = supabase
+      .from("memories")
+      .select("id, content")
+      .eq("category", "preference");
+    prefQuery = applyUserFilter(prefQuery, options.userId);
+    const { data: prefs } = await prefQuery;
+
+    for (const row of prefs || []) {
+      if (getSemanticKey(row.content) === "preference:favorite-color") {
+        await supabase.from("memories").delete().eq("id", row.id);
+      }
     }
-
-    db.prepare(`
-      INSERT INTO memories (
-        category,
-        content,
-        normalized_content,
-        group_key,
-        importance,
-        source,
-        created_at,
-        updated_at
-      )
-      VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-
-      ON CONFLICT(normalized_content)
-      DO UPDATE SET
-        category = excluded.category,
-        content = excluded.content,
-        group_key = excluded.group_key,
-        importance = excluded.importance,
-        source = excluded.source,
-        updated_at = CURRENT_TIMESTAMP
-    `).run(finalCategory, finalContent, normalized, groupKey, importance, source);
-
-    const saved = db
-      .prepare(
-        `
-        SELECT *
-        FROM memories
-        WHERE normalized_content = ?
-        `
-      )
-      .get(normalized) as Memory | undefined;
-
-    db.exec("COMMIT");
-    return saved || null;
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
   }
+
+  const payload: Record<string, unknown> = {
+    category: finalCategory,
+    content: finalContent,
+    normalized_content: normalized,
+    group_key: groupKey,
+    importance,
+    source,
+    updated_at: now,
+  };
+  if (options.userId) payload.user_id = options.userId;
+
+  const { data, error } = await supabase
+    .from("memories")
+    .upsert(payload, {
+      onConflict: options.userId
+        ? "user_id,normalized_content"
+        : "normalized_content",
+    })
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data as Memory;
 }
 
-export function getAllMemories(): Memory[] {
-  const db = getDatabase();
-  return db
-    .prepare(
-      `
-      SELECT *
-      FROM memories
-      ORDER BY importance DESC, updated_at DESC, id DESC
-      `
-    )
-    .all() as Memory[];
+export async function getAllMemories(userId?: string): Promise<Memory[]> {
+  const supabase = getSupabase();
+  let query = supabase
+    .from("memories")
+    .select("*")
+    .order("importance", { ascending: false })
+    .order("updated_at", { ascending: false })
+    .order("id", { ascending: false });
+
+  query = applyUserFilter(query, userId);
+  const { data, error } = await query;
+  if (error) throw error;
+  return (data || []) as Memory[];
 }
 
-export function searchMemories(query: string): Memory[] {
+export async function searchMemories(
+  query: string,
+  userId?: string
+): Promise<Memory[]> {
   const cleanQuery = normalizeText(query);
   if (!cleanQuery) return [];
 
@@ -613,7 +359,8 @@ export function searchMemories(query: string): Memory[] {
 
   if (queryWords.length === 0) return [];
 
-  return getAllMemories()
+  const all = await getAllMemories(userId);
+  return all
     .map((memory) => {
       const content = normalizeText(memory.content);
       const group = normalizeText(memory.group_key || "");
@@ -627,7 +374,6 @@ export function searchMemories(query: string): Memory[] {
       if (queryWords.includes("favorite") && detectFavoriteColor(memory.content)) {
         score += 10;
       }
-
       if (memory.importance >= 4) score += 1;
 
       return { memory, score };
@@ -638,32 +384,34 @@ export function searchMemories(query: string): Memory[] {
     .map((item) => item.memory);
 }
 
-export function getMemoriesByGroup(groupKey: string): Memory[] {
-  const db = getDatabase();
-  return db
-    .prepare(
-      `
-      SELECT *
-      FROM memories
-      WHERE group_key = ?
-      ORDER BY importance DESC, updated_at DESC
-      `
-    )
-    .all(groupKey.toLowerCase()) as Memory[];
+export async function getMemoriesByGroup(
+  groupKey: string,
+  userId?: string
+): Promise<Memory[]> {
+  const supabase = getSupabase();
+  let query = supabase
+    .from("memories")
+    .select("*")
+    .eq("group_key", groupKey.toLowerCase())
+    .order("importance", { ascending: false })
+    .order("updated_at", { ascending: false });
+
+  query = applyUserFilter(query, userId);
+  const { data, error } = await query;
+  if (error) throw error;
+  return (data || []) as Memory[];
 }
 
-export function updateMemory(
+export async function updateMemory(
   id: number,
   content: string,
-  category = "general"
-): Memory | null {
+  category = "general",
+  userId?: string
+): Promise<Memory | null> {
   const prepared = prepareMemory(content, category);
   if (!prepared) return null;
 
-  const db = getDatabase();
-  const existing = db.prepare("SELECT id FROM memories WHERE id = ?").get(id);
-  if (!existing) return null;
-
+  const supabase = getSupabase();
   const { finalContent, finalCategory, normalized, favoriteColor } = prepared;
   const groupKey = inferGroupKey(
     finalContent,
@@ -671,70 +419,46 @@ export function updateMemory(
     favoriteColor ? "preferences" : null
   );
 
-  db.exec("BEGIN");
-  try {
-    if (favoriteColor) {
-      removeOldFavoriteColors(id);
-    }
+  let updateQuery = supabase
+    .from("memories")
+    .update({
+      content: finalContent,
+      category: finalCategory,
+      normalized_content: normalized,
+      group_key: groupKey,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", id);
 
-    const duplicate = db
-      .prepare(
-        `
-        SELECT id
-        FROM memories
-        WHERE normalized_content = ? AND id != ?
-        `
-      )
-      .get(normalized, id) as { id: number } | undefined;
-
-    if (duplicate) {
-      db.prepare("DELETE FROM memories WHERE id = ?").run(duplicate.id);
-    }
-
-    db.prepare(`
-      UPDATE memories
-      SET
-        content = ?,
-        category = ?,
-        normalized_content = ?,
-        group_key = ?,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(finalContent, finalCategory, normalized, groupKey, id);
-
-    const updated = db
-      .prepare("SELECT * FROM memories WHERE id = ?")
-      .get(id) as Memory | undefined;
-
-    db.exec("COMMIT");
-    return updated || null;
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
+  updateQuery = applyUserFilter(updateQuery, userId);
+  const { data, error } = await updateQuery.select().single();
+  if (error) return null;
+  return data as Memory;
 }
 
-export function deleteMemory(id: number) {
-  const db = getDatabase();
-  return db.prepare("DELETE FROM memories WHERE id = ?").run(id);
+export async function deleteMemory(id: number, userId?: string) {
+  const supabase = getSupabase();
+  let query = supabase.from("memories").delete().eq("id", id);
+  query = applyUserFilter(query, userId);
+  return await query;
 }
 
-export function markMemoryUsed(id: number) {
-  const db = getDatabase();
-  db.prepare(
-    `
-    UPDATE memories
-    SET last_used_at = CURRENT_TIMESTAMP
-    WHERE id = ?
-    `
-  ).run(id);
+export async function markMemoryUsed(id: number, userId?: string) {
+  const supabase = getSupabase();
+  let query = supabase
+    .from("memories")
+    .update({ last_used_at: new Date().toISOString() })
+    .eq("id", id);
+  query = applyUserFilter(query, userId);
+  await query;
 }
 
-export function saveConversation(
+export async function saveConversation(
   id: string,
   title: string,
-  messages: ConversationMessage[]
-): Conversation | null {
+  messages: ConversationMessage[],
+  userId?: string
+): Promise<Conversation | null> {
   const conversationId = id.trim();
   if (!conversationId || conversationId.length > 200) {
     throw new Error("Invalid conversation ID.");
@@ -743,7 +467,7 @@ export function saveConversation(
     throw new Error("Messages must be an array.");
   }
 
-  const cleanMessages: ConversationMessage[] = messages.map((message) => {
+  const cleanMessages = messages.map((message) => {
     if (
       !message ||
       !["user", "assistant"].includes(message.role) ||
@@ -751,10 +475,7 @@ export function saveConversation(
     ) {
       throw new Error("Invalid conversation message.");
     }
-    return {
-      role: message.role,
-      content: message.content,
-    };
+    return { role: message.role, content: message.content };
   });
 
   const cleanTitle =
@@ -762,119 +483,115 @@ export function saveConversation(
       ? title.trim().slice(0, 200) || "New Chat"
       : "New Chat";
 
-  const db = getDatabase();
+  const supabase = getSupabase();
+  const now = new Date().toISOString();
 
-  db.exec("BEGIN");
-  try {
-    db.prepare(`
-      INSERT INTO conversations (id, title)
-      VALUES (?, ?)
-      ON CONFLICT(id)
-      DO UPDATE SET
-        title = excluded.title,
-        updated_at = CURRENT_TIMESTAMP
-    `).run(conversationId, cleanTitle);
+  const convPayload: Record<string, unknown> = {
+    id: conversationId,
+    title: cleanTitle,
+    updated_at: now,
+  };
+  if (userId) convPayload.user_id = userId;
 
-    db.prepare("DELETE FROM conversation_messages WHERE conversation_id = ?").run(
-      conversationId
-    );
+  const { data: savedConv, error: convError } = await supabase
+    .from("conversations")
+    .upsert(convPayload, { onConflict: "id" })
+    .select()
+    .single();
 
-    const insertMessage = db.prepare(`
-      INSERT INTO conversation_messages (
-        conversation_id,
-        role,
-        content,
-        position
-      )
-      VALUES (?, ?, ?, ?)
-    `);
+  if (convError) throw convError;
 
-    cleanMessages.forEach((message, index) => {
-      insertMessage.run(conversationId, message.role, message.content, index);
-    });
+  await supabase
+    .from("conversation_messages")
+    .delete()
+    .eq("conversation_id", conversationId);
 
-    const saved = db
-      .prepare("SELECT * FROM conversations WHERE id = ?")
-      .get(conversationId) as Conversation | undefined;
+  if (cleanMessages.length > 0) {
+    const rows = cleanMessages.map((msg, index) => ({
+      conversation_id: conversationId,
+      role: msg.role,
+      content: msg.content,
+      position: index,
+    }));
 
-    db.exec("COMMIT");
-    return saved || null;
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
+    const { error: msgError } = await supabase
+      .from("conversation_messages")
+      .insert(rows);
+
+    if (msgError) throw msgError;
   }
+
+  return savedConv as Conversation;
 }
 
-export function getConversation(
-  conversationId: string
-): ConversationWithMessages | null {
-  const db = getDatabase();
-  const conversation = db
-    .prepare("SELECT * FROM conversations WHERE id = ?")
-    .get(conversationId) as Conversation | undefined;
+export async function getConversation(
+  conversationId: string,
+  userId?: string
+): Promise<ConversationWithMessages | null> {
+  const supabase = getSupabase();
+  let convQuery = supabase
+    .from("conversations")
+    .select("*")
+    .eq("id", conversationId);
 
-  if (!conversation) return null;
+  convQuery = applyUserFilter(convQuery, userId);
+  const { data: conversation, error } = await convQuery.single();
+  if (error || !conversation) return null;
 
-  const messages = db
-    .prepare(
-      `
-      SELECT *
-      FROM conversation_messages
-      WHERE conversation_id = ?
-      ORDER BY position ASC, id ASC
-      `
-    )
-    .all(conversationId) as StoredConversationMessage[];
+  const { data: messages } = await supabase
+    .from("conversation_messages")
+    .select("*")
+    .eq("conversation_id", conversationId)
+    .order("position", { ascending: true })
+    .order("id", { ascending: true });
 
   return {
-    ...conversation,
-    messages,
+    ...(conversation as Conversation),
+    messages: (messages || []) as StoredConversationMessage[],
   };
 }
 
-export function getConversations(): Conversation[] {
-  const db = getDatabase();
-  return db
-    .prepare(
-      `
-      SELECT *
-      FROM conversations
-      ORDER BY updated_at DESC, created_at DESC
-      `
-    )
-    .all() as Conversation[];
+export async function getConversations(userId?: string): Promise<Conversation[]> {
+  const supabase = getSupabase();
+  let query = supabase
+    .from("conversations")
+    .select("*")
+    .order("updated_at", { ascending: false })
+    .order("created_at", { ascending: false });
+
+  query = applyUserFilter(query, userId);
+  const { data, error } = await query;
+  if (error) throw error;
+  return (data || []) as Conversation[];
 }
 
-export function deleteConversation(conversationId: string): boolean {
-  const db = getDatabase();
-  const result = db
-    .prepare("DELETE FROM conversations WHERE id = ?")
-    .run(conversationId);
-  return Number(result.changes) > 0;
+export async function deleteConversation(
+  conversationId: string,
+  userId?: string
+): Promise<boolean> {
+  const supabase = getSupabase();
+  let query = supabase.from("conversations").delete().eq("id", conversationId);
+  query = applyUserFilter(query, userId);
+  const { error } = await query;
+  return !error;
 }
 
-export function getRecentConversationMessages(
+export async function getRecentConversationMessages(
   conversationId: string,
   limit = 20
-): StoredConversationMessage[] {
-  const db = getDatabase();
+): Promise<StoredConversationMessage[]> {
+  const supabase = getSupabase();
   const safeLimit = Math.max(1, Math.min(100, Math.floor(limit)));
 
-  return db
-    .prepare(
-      `
-      SELECT *
-      FROM (
-        SELECT *
-        FROM conversation_messages
-        WHERE conversation_id = ?
-        ORDER BY position DESC, id DESC
-        LIMIT ?
-      )
-      ORDER BY position ASC, id ASC
-      `
-    )
-    .all(conversationId, safeLimit) as StoredConversationMessage[];
+  const { data, error } = await supabase
+    .from("conversation_messages")
+    .select("*")
+    .eq("conversation_id", conversationId)
+    .order("position", { ascending: false })
+    .limit(safeLimit);
+
+  if (error) throw error;
+  return ((data || []) as StoredConversationMessage[]).reverse();
 }
 
 export type RelevantConversationMessage = {
@@ -885,13 +602,13 @@ export type RelevantConversationMessage = {
   created_at: string;
 };
 
-export function searchConversationHistory(
+export async function searchConversationHistory(
   query: string,
   excludeConversationId?: string | null,
-  limit = 8
-): RelevantConversationMessage[] {
-  const db = getDatabase();
-
+  limit = 8,
+  userId?: string
+): Promise<RelevantConversationMessage[]> {
+  const supabase = getSupabase();
   const stopWords = new Set([
     "hai", "hain", "ho", "tha", "thi", "the",
     "aur", "ka", "ki", "ke", "ko", "se", "me",
@@ -908,143 +625,57 @@ export function searchConversationHistory(
     "conversation", "discussed", "talked",
   ]);
 
-  const synonyms: Record<string, string[]> = {
-    development: ["coding", "programming", "technology"],
-    coding: ["programming", "development"],
-    programming: ["coding", "development"],
-    learning: ["learn", "study", "seekhna", "education", "roadmap"],
-    learn: ["learning", "study", "seekhna", "education", "roadmap"],
-    seekhne: ["learning", "learn", "study", "education", "roadmap"],
-    skills: ["skill", "learning", "roadmap"],
-    skill: ["skills", "learning", "roadmap"],
-    roadmap: ["plan", "planning", "strategy", "goal"],
-    plan: ["roadmap", "planning", "strategy", "goal"],
-    business: ["sales", "startup"],
-    startup: ["business", "company"],
-    product: ["building", "development"],
-    building: ["product", "development"],
-    ai: ["artificial", "intelligence"],
-    artificial: ["ai", "intelligence"],
-    intelligence: ["ai", "artificial"],
-    founder: ["creator", "owner"],
-    creator: ["founder", "owner"],
-    project: ["development", "building"],
-  };
-
-  const originalTerms = [
+  const terms = [
     ...new Set(
       query
         .toLowerCase()
         .split(/[^\p{L}\p{N}]+/u)
         .filter((word) => word.length >= 3 && !stopWords.has(word))
     ),
-  ];
+  ].slice(0, 10);
 
-  if (originalTerms.length === 0) return [];
+  if (terms.length === 0) return [];
 
-  const expandedTerms = new Set<string>(originalTerms);
-  for (const word of originalTerms) {
-    for (const synonym of synonyms[word] || []) {
-      expandedTerms.add(synonym);
-    }
+  let convQuery = supabase.from("conversations").select("id, title, user_id");
+  convQuery = applyUserFilter(convQuery, userId);
+  const { data: convs } = await convQuery;
+
+  const validConvs = new Map<string, string>();
+  for (const c of convs || []) {
+    if (excludeConversationId && c.id === excludeConversationId) continue;
+    validConvs.set(c.id, c.title);
   }
 
-  const terms = [...expandedTerms].slice(0, 25);
+  if (validConvs.size === 0) return [];
+
+  const { data: msgs } = await supabase
+    .from("conversation_messages")
+    .select("conversation_id, role, content, created_at")
+    .in("conversation_id", [...validConvs.keys()])
+    .order("created_at", { ascending: false })
+    .limit(500);
+
   const safeLimit = Math.max(1, Math.min(20, Math.floor(limit)));
-  const conditions = terms.map(() => "LOWER(cm.content) LIKE ?").join(" OR ");
-  const parameters: (string | number)[] = terms.map((term) => `%${term}%`);
-
-  let excludeCondition = "";
-  if (excludeConversationId) {
-    excludeCondition = "AND c.id != ?";
-    parameters.push(excludeConversationId);
-  }
-
-  const results = db
-    .prepare(
-      `
-      SELECT
-        c.id AS conversation_id,
-        c.title AS conversation_title,
-        cm.role,
-        cm.content,
-        cm.created_at
-      FROM conversation_messages cm
-      INNER JOIN conversations c
-        ON c.id = cm.conversation_id
-      WHERE (${conditions})
-        ${excludeCondition}
-      ORDER BY cm.created_at DESC
-      LIMIT 1000
-      `
-    )
-    .all(...parameters) as RelevantConversationMessage[];
-
-  const queryPhrase = query
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  const scoredResults = results.map((item) => {
-    const content = item.content.toLowerCase();
-    const title = item.conversation_title.toLowerCase();
-
-    let score = 0;
-    let matchedTerms = 0;
-
-    for (const term of originalTerms) {
-      if (content.includes(term)) {
-        score += 5;
-        matchedTerms++;
+  const scored = (msgs || [])
+    .map((msg) => {
+      const lower = String(msg.content || "").toLowerCase();
+      let score = 0;
+      for (const term of terms) {
+        if (lower.includes(term)) score += 5;
       }
-      if (title.includes(term)) {
-        score += 3;
-      }
-    }
-
-    for (const term of terms) {
-      if (!originalTerms.includes(term) && content.includes(term)) {
-        score += 2;
-      }
-    }
-
-    if (queryPhrase.length >= 6 && content.includes(queryPhrase)) {
-      score += 20;
-    }
-
-    if (originalTerms.length > 1) {
-      const matchRatio = matchedTerms / originalTerms.length;
-      score += matchRatio * 5;
-    }
-
-    if (item.role === "user") {
-      score += 1;
-    }
-
-    const daysOld =
-      (Date.now() - new Date(item.created_at).getTime()) /
-      (1000 * 60 * 60 * 24);
-
-    if (Number.isFinite(daysOld)) {
-      score += Math.max(0, 2 - daysOld / 30);
-    }
-
-    return {
-      ...item,
-      score,
-      matchedTerms,
-    };
-  });
-
-  return scoredResults
+      return {
+        conversation_id: msg.conversation_id,
+        conversation_title: validConvs.get(msg.conversation_id) || "Chat",
+        role: msg.role as "user" | "assistant",
+        content: msg.content,
+        created_at: msg.created_at,
+        score,
+      };
+    })
     .filter((item) => item.score > 0)
-    .sort(
-      (a, b) =>
-        b.score - a.score ||
-        b.matchedTerms - a.matchedTerms ||
-        b.created_at.localeCompare(a.created_at)
-    )
+    .sort((a, b) => b.score - a.score)
     .slice(0, safeLimit)
-    .map(({ score, matchedTerms, ...item }) => item);
+    .map(({ score, ...rest }) => rest);
+
+  return scored;
 }
