@@ -36,6 +36,7 @@ type UserSettings = {
   autoSpeakReplies: boolean;
 };
 
+const ADMIN_EMAIL = "roydxamit@gmail.com";
 const STORAGE_KEY = "abhyq_conversations";
 const SETTINGS_KEY = "abhyq_user_settings";
 const AI_MODE_KEY = "abhyq_ai_mode";
@@ -194,6 +195,9 @@ export default function Home() {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const recognitionRef = useRef<any>(null);
 
+  const isAdmin = userEmail?.toLowerCase() === ADMIN_EMAIL;
+  const effectiveAiMode: "cloud" | "local" = isAdmin ? aiMode : "cloud";
+
   // LOAD SAVED SETTINGS & AI MODE
   useEffect(() => {
     try {
@@ -221,6 +225,7 @@ export default function Home() {
   }, []);
 
   function toggleAiMode() {
+    if (!isAdmin) return;
     setAiMode((prev) => {
       const next = prev === "cloud" ? "local" : "cloud";
       localStorage.setItem(AI_MODE_KEY, next);
@@ -839,7 +844,7 @@ export default function Home() {
             },
           ],
           conversationId: chatId,
-          aiMode,
+          aiMode: effectiveAiMode,
           webSearch,
           attachment: currentAttachment,
           title:
@@ -1141,24 +1146,32 @@ export default function Home() {
               </span>
             )}
 
-            <button
-              type="button"
-              className="status-pill"
-              onClick={toggleAiMode}
-              title="Switch between Cloud AI (Groq) and Local AI (Ollama)"
-            >
-              <span
-                className="status-dot"
-                style={{
-                  background: aiMode === "local" ? "#ffd400" : "#b8ed54",
-                  boxShadow:
-                    aiMode === "local"
-                      ? "0 0 9px #ffd400"
-                      : "0 0 9px #b8ed54",
-                }}
-              />
-              {aiMode === "local" ? "Local AI" : "Cloud AI"}
-            </button>
+            {isAdmin ? (
+              <button
+                type="button"
+                className="status-pill"
+                onClick={toggleAiMode}
+                title="Admin only: Switch between Cloud AI and Local AI"
+              >
+                <span
+                  className="status-dot"
+                  style={{
+                    background:
+                      effectiveAiMode === "local" ? "#ffd400" : "#b8ed54",
+                    boxShadow:
+                      effectiveAiMode === "local"
+                        ? "0 0 9px #ffd400"
+                        : "0 0 9px #b8ed54",
+                  }}
+                />
+                {effectiveAiMode === "local" ? "Local AI" : "Cloud AI"}
+              </button>
+            ) : (
+              <div className="status-pill" style={{ cursor: "default" }}>
+                <span className="status-dot" />
+                Cloud AI
+              </div>
+            )}
 
             <button
               type="button"
@@ -1317,7 +1330,7 @@ export default function Home() {
                           <small>
                             {webSearch
                               ? "Searching web..."
-                              : aiMode === "local"
+                              : effectiveAiMode === "local"
                               ? "Thinking locally..."
                               : "Thinking..."}
                           </small>
@@ -1348,7 +1361,7 @@ export default function Home() {
                         : "FILE MODE"
                       : webSearch
                       ? "LIVE WEB MODE"
-                      : aiMode === "local"
+                      : effectiveAiMode === "local"
                       ? "LOCAL AI MODE"
                       : "CLOUD STREAM MODE"}
                   </span>
@@ -1644,21 +1657,23 @@ export default function Home() {
                   </div>
                 </div>
 
-                <div className="settings-row">
-                  <div>
-                    <strong>AI Engine Mode</strong>
-                    <span>Switch between Cloud AI (Groq) and Local AI (Ollama)</span>
+                {isAdmin && (
+                  <div className="settings-row">
+                    <div>
+                      <strong>AI Engine Mode (Admin)</strong>
+                      <span>Switch between Cloud AI and Local AI</span>
+                    </div>
+                    <button
+                      type="button"
+                      className={`toggle-btn ${
+                        effectiveAiMode === "local" ? "toggle-on" : ""
+                      }`}
+                      onClick={toggleAiMode}
+                    >
+                      {effectiveAiMode === "local" ? "LOCAL" : "CLOUD"}
+                    </button>
                   </div>
-                  <button
-                    type="button"
-                    className={`toggle-btn ${
-                      aiMode === "local" ? "toggle-on" : ""
-                    }`}
-                    onClick={toggleAiMode}
-                  >
-                    {aiMode === "local" ? "LOCAL" : "CLOUD"}
-                  </button>
-                </div>
+                )}
 
                 <div className="settings-row">
                   <div>
